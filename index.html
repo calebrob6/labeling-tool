@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <meta name="description" content="">
+    <meta name="author" content="">
+    <link rel="icon" href="favicon.ico">
+
+    <title>Land Cover Labeling</title>
+
+    <link href="css/bootstrap.min.css" rel="stylesheet">
+    <style type="text/css">
+        body {
+            padding-top: 2rem;
+            padding-left: 6rem;
+            padding-right: 6em;
+        }
+
+        h1 {
+            font-size: 200%;
+        }
+
+        .row{
+            margin-bottom: 2rem;
+        }
+
+        .center{
+            text-align: center;
+        }
+
+
+
+        #water{
+            color: #fff;
+            background-color: rgb(0,0,255);
+            border-color: rgb(0,0,255);
+        }
+        #water:hover{
+            color: #000;
+        }
+        #tree{
+            color: #fff;
+            background-color: rgb(0,128,0);
+            border-color: rgb(0,128,0);
+        }
+        #tree:hover{
+            color: #000;
+        }
+        #field{
+            color: #333;
+            background-color: rgb(128,255,128);
+            border-color: rgb(128,255,128);
+        }
+        #field:hover{
+            color: #fff;
+        }
+        #built{
+            color: #fff;
+            background-color: rgb(128,96,96);
+            border-color: rgb(128,96,96);
+        }
+        #built:hover{
+            color: #000;
+        }
+        #unknown{
+            color: #fff;
+            background-color: rgb(0, 0, 0);
+            border-color: rgb(0, 0, 0);
+        }
+        #unknown:hover{
+            color: rgb(255, 255, 255);
+        }
+
+        
+
+        .satelliteImage{
+            width:240px;
+            height:240px;
+            border: 1px solid black;
+        }
+
+        .imgContainer{
+            padding:30px;
+        }
+
+        .dimmed {
+            position: relative;
+        }
+
+        .dimmed:after {
+            content: " ";
+            z-index: 10;
+            display: block;
+            position: absolute;
+            height: 100%;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.5);
+        }
+    </style>
+
+</head>
+
+<body>
+
+    <div class="container-fluid">
+
+        <div class="row">
+            <div class="col-md-12">
+                <h1 class="center">Land cover labeling tool</h1>
+            </div>
+        </div>
+
+        <div class="row">
+    
+            <div class="col-md-5 center imgContainer">
+                <img src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" class="" id="imgHuge"/>
+            </div>
+
+            <div class="col-md-7">
+
+                <div class="row center imgContainer">
+                    <div class="col-md-4">
+                        <img src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" class="satelliteImage" id="imgLarge"/>
+                    </div>
+                    <div class="col-md-4">
+                        <img src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" class="satelliteImage" id="imgMedium"/>
+                    </div>
+                    <div class="col-md-4">
+                        <img src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" class="satelliteImage" id="imgSmall"/>
+                    </div>
+                </div>
+
+                <div class="row center">
+                    <div class="col-md-2 offset-md-1">
+                        <button type="button" class="btn btn-lg btn-block" id="water">Water (1)</button>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="button" class="btn btn-lg btn-block" id="tree">Tree Canopy (2)</button>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="button" class="btn btn-lg btn-block" id="field">Field (3)</button>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="button" class="btn btn-lg btn-block" id="built">Built Surface (4)</button>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="button" class="btn btn-lg btn-block" id="unknown">Not Sure (5)</button>
+                    </div>
+                </div>
+
+                <div class="row">
+                    <div class="col-md-12">
+                        <p>Number of labels submitted: <span id="numLabels">0</span></p>
+                    </div>
+                </div>
+
+                <div class="row">
+                    <div class="col-md-12">
+                        <p>The above images show a single area at three levels of decreasing spatial context: 240x240 meters, 120x120 meters, and 19x19 meters.</p>
+                        <p>The red square highlights the same area in each image.</p>
+                        <p>The image to the left shows where this 240x240 meter area is located in a much larger context (again, highlighted in red).</p>
+                        <p>Use the buttons to label the <b>central pixel</b> in this area, shown underneath the crosshairs of the third image.</p>
+                        <p>You can also use the hotkeys 1-4 (the corresonding number is labeled on each button) instead of clicking.</p>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+
+
+    <script src="js/jquery-3.3.1.min.js"></script>
+    <script src="js/bootstrap.bundle.min.js"></script>
+    
+    <script type="text/javascript">
+
+        var BACKEND_URL = "http://msrcalebubuntu.eastus.cloudapp.azure.com:4042/"
+        var isLoading = false;
+
+        var currentSample = null;
+        var numLabels = 0;
+
+        var notifyFail = function(jqXHR, textStatus, errorThrown){
+            var response = $.parseJSON(jqXHR.responseText);
+            console.log("Error in processing server: " + response.error);
+        };
+
+        
+        var recordSample = function(label){
+            currentSample["label"] = label;
+    
+            $.ajax({
+                type: "POST",
+                url: BACKEND_URL + "recordSample",
+                data: JSON.stringify(currentSample),
+                success: function(data, textStatus, jqXHR){
+
+                    numLabels += 1;
+                    $("#numLabels").text(numLabels);
+                    getSample();
+                },
+                error: notifyFail,
+                dataType: "json",
+                contentType: "application/json"
+            });
+
+        };
+        
+        var getSample = function(){
+            $(".imgContainer").addClass("dimmed");
+            isLoading = true;
+            
+            $.ajax({
+                type: "POST",
+                url: BACKEND_URL + "getSample",
+                data: JSON.stringify({"sample": true}),
+                success: function(data, textStatus, jqXHR){
+
+                    var imgLarge = "data:image/jpeg;base64," + data["imgLarge"];
+                    var imgMedium = "data:image/jpeg;base64," + data["imgMedium"];
+                    var imgSmall = "data:image/png;base64," + data["imgSmall"];
+
+                    var imgHuge = "data:image/jpeg;base64," + data["imgHuge"];
+                    
+                    $("#imgLarge").attr("src", imgLarge);
+                    $("#imgMedium").attr("src", imgMedium);
+                    $("#imgSmall").attr("src", imgSmall);
+
+                    $("#imgHuge").attr("src", imgHuge);
+
+                    delete data["imgLarge"];
+                    delete data["imgMedium"];
+                    delete data["imgSmall"];
+                    delete data["imgHuge"];
+
+                    currentSample = data;
+                    $(".imgContainer").removeClass("dimmed");
+                    isLoading = false;
+                },
+                error: notifyFail,
+                dataType: "json",
+                contentType: "application/json"
+            });
+        };
+        
+       
+        $(document).ready(function(){
+
+            getSample();
+
+            $(".btn").click(function(){
+                if(!isLoading){
+                    recordSample(this.id);
+                }
+            })
+
+            $(document).keypress(function( e ) {
+                if(!isLoading){
+                    if(e.which == 49) {
+                        recordSample("water");
+                    }
+                    else if(e.which == 50){
+                        recordSample("tree");
+                    }
+                    else if(e.which == 51){
+                        recordSample("field");
+                    }
+                    else if(e.which == 52){
+                        recordSample("built");
+                    }
+                    else if(e.which == 53){
+                        recordSample("unknown");
+                    }
+                }
+                e.preventDefault();
+            });
+
+        });
+
+    </script>
+</body>
+
+</html>
