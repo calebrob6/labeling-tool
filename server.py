@@ -14,6 +14,9 @@ import numpy as np
 import cv2
 
 import rasterio
+import rasterio.mask
+import shapely
+import shapely.geometry
 
 import logging
 
@@ -83,6 +86,7 @@ def record_sample():
 
     log_row = [
         client_ip,
+        str(data["time"]),
         time.ctime(),
         data["fn"],
         str(data["x"]),
@@ -115,14 +119,16 @@ def get_sample():
     start_idx = midpoint-r-1
     size = r*2 + 2
     for i in range(start_idx, start_idx+size+1):
-        naip_img[start_idx,i] = [255,0,0]
-        naip_img[i,start_idx] = [255,0,0]
-        naip_img[start_idx+size,i] = [255,0,0]
-        naip_img[i,start_idx+size] = [255,0,0]
+        rem = (i//3)%3
+        color = [ 0 if rem==2 else 255, 255 if rem==0 else 0, 255 if rem==0 else 0 ]
+        naip_img[start_idx,i] = color
+        naip_img[i,start_idx] = color
+        naip_img[start_idx+size,i] = color
+        naip_img[i,start_idx+size] = color
 
     img1 = naip_img.copy()
     img2 = naip_img[60:-60,60:-60].copy()
-    img3 = naip_img[start_idx:start_idx+size+1,start_idx:start_idx+size+1].copy()
+    img3 = naip_img[start_idx+1:start_idx+size,start_idx+1:start_idx+size].copy()
 
     img1 = cv2.imencode(".jpg", cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))[1].tostring()
     img1 = base64.b64encode(img1).decode("utf-8")
@@ -137,7 +143,7 @@ def get_sample():
     #print("Image 2 size: %d" % (len(img2)))
 
     t_h, t_w, t_c = img3.shape
-    cv2.circle(img3, (t_h//2, t_w//2), 4, (0,0,0), 1)
+    
     img3 = cv2.imencode(".png", cv2.cvtColor(img3, cv2.COLOR_RGB2BGR))[1].tostring()
     img3 = base64.b64encode(img3).decode("utf-8")
     data["imgSmall"] = img3
@@ -153,6 +159,7 @@ def get_sample():
 
     #print("Image 4 size: %d" % (len(img4)))
 
+    data["time"] = time.ctime()
     data["fn"] = fn
     data["x"] = x
     data["y"] = y
@@ -167,7 +174,24 @@ def get_sample():
 #---------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------
 
+def bounds_intersection(bound0, bound1):
+    left0, bottom0, right0, top0 = bound0
+    left1, bottom1, right1, top1 = bound1
+    left, bottom, right, top = \
+            max([left0, left1]), max([bottom0, bottom1]), \
+            min([right0, right1]), min([top0, top1])
+    return (left, bottom, right, top)
+
 def queue_loader(queue, repeat_queue):
+
+    mapping = {}
+    f = open("/mnt/afs/code/data/good_blobs_to_best_tiles_map.csv","r")
+    f.readline()
+    lines = f.read().strip().split("\n")
+    for line in lines:
+        parts = line.split(",")
+        mapping[parts[0]] = parts[1]
+    f.close()
 
     if TESTING:
         f = open("data/training_sets_testing.txt","r")
@@ -180,19 +204,32 @@ def queue_loader(queue, repeat_queue):
     lc_tiles = []
     for naip_fn in fns:
         print("Loading %s" % (naip_fn))
-        f = rasterio.open(naip_fn, "r")
-        naip_data = f.read()
-        naip_data = np.rollaxis(naip_data, 0, 3)
-        f.close()
 
+        naip_2011_fn = mapping[naip_fn]
+
+        naip_f = rasterio.open(naip_2011_fn, "r")
+        naip_bounds = naip_f.bounds
+        
         lc_fn = naip_fn.replace("esri-naip", "resampled-lc")[:-4] + "_lc.tif"
-        f = rasterio.open(lc_fn, "r")
-        lc_data = f.read().squeeze()
-        f.close()
+        lc_f = rasterio.open(lc_fn, "r")
+        lc_bounds = lc_f.bounds
+
+        bounds = bounds_intersection(naip_bounds, lc_bounds)
+        left, bottom, right, top = bounds
+        geom = shapely.geometry.mapping(shapely.geometry.box(left, bottom, right, top, ccw=True))
+        
+        naip_data, _ = rasterio.mask.mask(naip_f, [geom], crop=True)
+        naip_data = np.rollaxis(naip_data, 0, 3)
+
+        lc_data, _ = rasterio.mask.mask(lc_f, [geom], crop=True)
+        lc_data = lc_data.squeeze()
 
         lc_data[lc_data == 5] = 4
         lc_data[lc_data == 6] = 4
         lc_data[lc_data > 6] = 0
+
+        naip_f.close()
+        lc_f.close()
 
         naip_tiles.append(naip_data)
         lc_tiles.append(lc_data)
