@@ -90,6 +90,15 @@
             max-width: 700px;
         }
 
+        .exampleImage{
+            display:inline-block;
+            width: 3cm;
+        }
+
+        table td{
+            padding:5px;
+        }
+
         .imgContainer {
             padding: 30px;
         }
@@ -203,6 +212,45 @@
                 <div class="row">
                     <div class="col-md-12">
                         <h2 class="mb-4">Class examples</h2>
+                        <table>
+                            <tr>
+                                <td><h4>Water</h4></td>
+                                <td><img class="exampleImage" src="img/examples/water1.jpg"><img class="exampleImage pixelated" src="img/examples/water1.png"></td>
+                                <td><img class="exampleImage" src="img/examples/water2.jpg"><img class="exampleImage pixelated" src="img/examples/water2.png"></td>
+                                <td><img class="exampleImage" src="img/examples/water3.jpg"><img class="exampleImage pixelated" src="img/examples/water3.png"></td>
+                            </tr>
+
+                            <tr>
+                                <td><h4>Tree Canopy</h4></td>
+                                <td><img class="exampleImage" src="img/examples/forest5.jpg"><img class="exampleImage pixelated" src="img/examples/forest5.png"></td>
+                                <td><img class="exampleImage" src="img/examples/forest2.jpg"><img class="exampleImage pixelated" src="img/examples/forest2.png"></td>
+                                <td><img class="exampleImage" src="img/examples/forest3.jpg"><img class="exampleImage pixelated" src="img/examples/forest3.png"></td>
+                            </tr>
+
+
+                            <tr>
+                                <td><h4>Low Vegetation</h4></td>
+                                <td><img class="exampleImage" src="img/examples/field1.jpg"><img class="exampleImage pixelated" src="img/examples/field1.png"></td>
+                                <td><img class="exampleImage" src="img/examples/field2.jpg"><img class="exampleImage pixelated" src="img/examples/field2.png"></td>
+                                <td><img class="exampleImage" src="img/examples/field5.jpg"><img class="exampleImage pixelated" src="img/examples/field5.png"></td>
+                            </tr>
+
+
+                            <tr>
+                                <td><h4>Impervious Surface</h4></td>
+                                <td><img class="exampleImage" src="img/examples/built1.jpg"><img class="exampleImage pixelated" src="img/examples/built1.png"></td>
+                                <td><img class="exampleImage" src="img/examples/built2.jpg"><img class="exampleImage pixelated" src="img/examples/built2.png"></td>
+                                <td><img class="exampleImage" src="img/examples/built3.jpg"><img class="exampleImage pixelated" src="img/examples/built3.png"></td>
+                            </tr>
+
+
+                            <tr>
+                                <td><h4>Not Sure</h4></td>
+                                <td><img class="exampleImage" src="img/examples/unsure1.jpg"><img class="exampleImage pixelated" src="img/examples/unsure1.png"></td>
+                                <td><img class="exampleImage" src="img/examples/unsure2.jpg"><img class="exampleImage pixelated" src="img/examples/unsure2.png"></td>
+                                <td><img class="exampleImage" src="img/examples/unsure3.jpg"><img class="exampleImage pixelated" src="img/examples/unsure3.png"></td>
+                            </tr>
+                        </table>
                     </div>
                 </div>
 
@@ -216,7 +264,7 @@
 
     <script type="text/javascript">
 
-        var BACKEND_URL = "http://msrcalebubuntu.eastus.cloudapp.azure.com:4042/"
+        var BACKEND_URL = "http://localhost:4042/"
         var isLoading = false;
 
         var currentSample = null;

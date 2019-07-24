@@ -1,6 +1,7 @@
 #! /usr/bin/env python
 # -*- coding: utf-8 -*-
 # vim:fenc=utf-8
+# pylint: disable=E1137,E1136,E0110
 import sys
 import os
 import time
@@ -14,27 +15,29 @@ import numpy as np
 import cv2
 
 import rasterio
-import rasterio.mask
-import shapely
-import shapely.geometry
+
+import uuid
+
+from azure.cosmosdb.table.tableservice import TableService
+from azure.cosmosdb.table.models import Entity
 
 import logging
 
 from multiprocessing import Queue, Process
+from queue import Empty
 
-queue = Queue()
-repeat_queue = Queue()
+global SAMPLE_QUEUE, REPEAT_QUEUE, OUTPUT_QUEUE
+SAMPLE_QUEUE = Queue()
+REPEAT_QUEUE = Queue()
+OUTPUT_QUEUE = Queue()
 
-logpath = "output/labels.csv"
-logger = logging.getLogger('log')
-logger.setLevel(logging.INFO)
-ch = logging.FileHandler(logpath)
-#ch.setFormatter(logging.Formatter('%(message)s'))
-logger.addHandler(ch)
-
-TESTING=False
+global MAX_QUEUE_SIZE, SAMPLE_SIZE
 MAX_QUEUE_SIZE = 128
 SAMPLE_SIZE = 240
+
+global TABLE_SERVICE, OUTPUT_PATH
+TABLE_SERVICE = None
+OUTPUT_PATH = None
 
 #---------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------
@@ -58,7 +61,6 @@ def do_options():
 #---------------------------------------------------------------------------------------
 
 def record_sample():
-    global queue, repeat_queue
     bottle.response.content_type = 'application/json'
     data = bottle.request.json
 
@@ -82,7 +84,7 @@ def record_sample():
     agrees = label == lc_labels[midpoint, midpoint]
     pct_agrees = np.sum(lc_labels == label) / (size**2)
 
-    num_disagreements = data["num_disagreements"]
+    num_times_labeled = data["num_times_labeled"]
 
     log_row = [
         client_ip,
@@ -93,29 +95,28 @@ def record_sample():
         str(data["y"]),
         str(data["sample_size"]),
         str(label),
-        str(num_disagreements),
+        str(num_times_labeled),
         str(agrees),
         "%0.4f" % (pct_agrees),
         data["labels"]
     ]
 
-    if not agrees and num_disagreements < 5:
-        repeat_queue.put((data["fn"], data["x"], data["y"], num_disagreements+1))
+    if num_times_labeled < 5:
+        REPEAT_QUEUE.put((data["fn"], data["x"], data["y"], num_times_labeled+1))
 
-    logger.info(','.join(log_row))
+    OUTPUT_QUEUE.put(log_row)
 
     bottle.response.status = 200
     return json.dumps(data)
 
 def get_sample():
-    global queue
     bottle.response.content_type = 'application/json'
     data = bottle.request.json
     
-    fn, x, y, SAMPLE_SIZE, naip_data, naip_img, lc_img, num_disagreements = queue.get()
+    fn, x, y, sample_size, naip_data, naip_img, lc_img, num_times_labeled = SAMPLE_QUEUE.get()
 
     r = 9
-    midpoint = SAMPLE_SIZE // 2
+    midpoint = sample_size // 2
     start_idx = midpoint-r-1
     size = r*2 + 2
     for i in range(start_idx, start_idx+size+1):
@@ -163,9 +164,9 @@ def get_sample():
     data["fn"] = fn
     data["x"] = x
     data["y"] = y
-    data["sample_size"] = SAMPLE_SIZE
+    data["sample_size"] = sample_size
     data["labels"] = ",".join(lc_img[midpoint-r:midpoint+r+1, midpoint-r:midpoint+r+1].flatten().astype(str))
-    data["num_disagreements"] = num_disagreements
+    data["num_times_labeled"] = num_times_labeled
 
     bottle.response.status = 200
     return json.dumps(data)
@@ -174,62 +175,35 @@ def get_sample():
 #---------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------
 
-def bounds_intersection(bound0, bound1):
-    left0, bottom0, right0, top0 = bound0
-    left1, bottom1, right1, top1 = bound1
-    left, bottom, right, top = \
-            max([left0, left1]), max([bottom0, bottom1]), \
-            min([right0, right1]), min([top0, top1])
-    return (left, bottom, right, top)
+def data_loader_process():
 
-def queue_loader(queue, repeat_queue):
-
-    mapping = {}
-    f = open("/mnt/afs/code/data/good_blobs_to_best_tiles_map.csv","r")
-    f.readline()
+    f = open("data/small_fns.txt","r")
+    naip_fns = []
+    lc_fns = []
     lines = f.read().strip().split("\n")
     for line in lines:
-        parts = line.split(",")
-        mapping[parts[0]] = parts[1]
-    f.close()
-
-    if TESTING:
-        f = open("data/training_sets_testing.txt","r")
-    else:
-        f = open("data/training_sets.txt","r")
-    fns = f.read().strip().split("\n")
+        t_fns = line.split(",")
+        naip_fns.append(t_fns[0])
+        lc_fns.append(t_fns[1])
     f.close()
 
     naip_tiles = []
     lc_tiles = []
-    for naip_fn in fns:
-        print("Loading %s" % (naip_fn))
+    for i in range(len(naip_fns)):
+        print("Loading %d/%d" % (i+1, len(naip_fns)))
 
-        naip_2011_fn = mapping[naip_fn]
-
-        naip_f = rasterio.open(naip_2011_fn, "r")
-        naip_bounds = naip_f.bounds
-        
-        lc_fn = naip_fn.replace("esri-naip", "resampled-lc")[:-4] + "_lc.tif"
-        lc_f = rasterio.open(lc_fn, "r")
-        lc_bounds = lc_f.bounds
-
-        bounds = bounds_intersection(naip_bounds, lc_bounds)
-        left, bottom, right, top = bounds
-        geom = shapely.geometry.mapping(shapely.geometry.box(left, bottom, right, top, ccw=True))
-        
-        naip_data, _ = rasterio.mask.mask(naip_f, [geom], crop=True)
+        f = rasterio.open(os.path.join("data", naip_fns[i]), "r")
+        naip_data = f.read()
         naip_data = np.rollaxis(naip_data, 0, 3)
+        f.close()
 
-        lc_data, _ = rasterio.mask.mask(lc_f, [geom], crop=True)
+        f = rasterio.open(os.path.join("data", lc_fns[i]), "r")
+        lc_data = f.read()
         lc_data = lc_data.squeeze()
-
         lc_data[lc_data == 5] = 4
         lc_data[lc_data == 6] = 4
         lc_data[lc_data > 6] = 0
-
-        naip_f.close()
-        lc_f.close()
+        f.close()
 
         naip_tiles.append(naip_data)
         lc_tiles.append(lc_data)
@@ -237,21 +211,21 @@ def queue_loader(queue, repeat_queue):
 
     i = 0
     while True:
-        if queue.qsize() < MAX_QUEUE_SIZE:
+        if SAMPLE_QUEUE.qsize() < MAX_QUEUE_SIZE:
             
-            num_disagreements = 0
+            num_times_labeled = 0
 
-            if not repeat_queue.empty():
-                print("Re-adding disagreed sample into queue")
-                fn, x, y, num_disagreements = repeat_queue.get()
-                idx = fns.index(fn)
+            print("[%s]\tSAMPLE_QUEUE: %d\tREPEAT_QUEUE: %d\tOUTPUT_QUEUE: %d" % (time.ctime(), SAMPLE_QUEUE.qsize(), REPEAT_QUEUE.qsize(), OUTPUT_QUEUE.qsize()))
+
+            if not REPEAT_QUEUE.empty() and np.random.rand()<0.7:
+                fn, x, y, num_times_labeled = REPEAT_QUEUE.get()
+                idx = naip_fns.index(fn)
 
                 naip_data = naip_tiles[idx]
                 lc_data = lc_tiles[idx]
             else:
-
-                idx = np.random.randint(0, len(fns))
-                fn = fns[idx]
+                idx = np.random.randint(0, len(naip_fns))
+                fn = naip_fns[idx]
                 naip_data = naip_tiles[idx]
                 lc_data = lc_tiles[idx]
 
@@ -261,13 +235,48 @@ def queue_loader(queue, repeat_queue):
             naip_img = naip_data[y:y+SAMPLE_SIZE, x:x+SAMPLE_SIZE, :3]
             lc_img = lc_data[y:y+SAMPLE_SIZE, x:x+SAMPLE_SIZE]
 
-            queue.put((fn, x, y, SAMPLE_SIZE, naip_data[:,:,:3], naip_img, lc_img, num_disagreements))
+            SAMPLE_QUEUE.put((fn, x, y, SAMPLE_SIZE, naip_data[:,:,:3], naip_img, lc_img, num_times_labeled))
             
             i += 1
         else:
             # sleep a bit, then check to see if the queue is full
             time.sleep(0.5)
 
+#---------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------
+
+def print_process():
+    
+    using_azure_tables = TABLE_SERVICE is not None
+
+    while True:
+        if not OUTPUT_QUEUE.empty():
+            row = OUTPUT_QUEUE.get()
+
+            if using_azure_tables:
+                log_row = {
+                    "PartitionKey": str(np.random.randint(0, 16)),
+                    "RowKey": str(uuid.uuid4()),
+                    "client_ip": row[0],
+                    "out_time": row[1],
+                    "in_time": row[2],
+                    "file_name": row[3],
+                    "x": row[4],
+                    "y": row[5],
+                    "size": row[6],
+                    "user_label": row[7],
+                    "number_of_times_labeled": row[8],
+                    "agrees_with_ground_truth": row[9],
+                    "percent_agreement_of_19m_neighborhood": row[10],
+                    "neighborhood_19m": row[11]
+                }
+                TABLE_SERVICE.insert_entity("randomlabeltool", log_row)
+            else:
+                f = open(OUTPUT_PATH, "a")
+                f.write("%s\n" % (",".join(row)))
+                f.close()
+        else:
+            time.sleep(0.5)
 #---------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------
 
@@ -284,17 +293,38 @@ def everything_else(filepath):
 #---------------------------------------------------------------------------------------
 
 def main():
-    global queue, repeat_queue
-    parser = argparse.ArgumentParser(description="Backend Server")
+    global TABLE_SERVICE, OUTPUT_PATH
+    parser = argparse.ArgumentParser(description="Server")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debugging", default=False)
     parser.add_argument("--host", action="store", dest="host", type=str, help="Host to bind to", default="0.0.0.0")
     parser.add_argument("--port", action="store", dest="port", type=int, help="Port to listen on", default=4042)
+    
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--azure_table', action="store_true", dest="azure_table")
+    group.add_argument("--output_path", action="store", dest="output_path", type=str, help="Path to directory where output will be stored")
 
     args = parser.parse_args(sys.argv[1:])
 
-    p = Process(target=queue_loader, args=(queue,repeat_queue))
-    p.start()
+    if args.azure_table:
+        assert "AZURE_ACCOUNT_NAME" in os.environ
+        assert "AZURE_ACCOUNT_KEY" in os.environ
+        print("Setting up TABLE_SERVICE")
+        TABLE_SERVICE = TableService(
+            account_name=os.environ['AZURE_ACCOUNT_NAME'],
+            account_key=os.environ['AZURE_ACCOUNT_KEY']
+        )
+    else:
+        assert not os.path.exists(args.output_path), "The output file already exists, data would be overwritten"
+        print("Setting up OUTPUT_PATH")
+        OUTPUT_PATH = args.output_path
+
+
+    p1 = Process(target=data_loader_process)
+    p1.start()
+
+    p2 = Process(target=print_process)
+    p2.start() 
 
     # Setup the bottle server 
     app = bottle.Bottle()

@@ -3,3 +3,5 @@ output/
 __pycache__/
 .ipynb_checkpoints/
 *.pyc
+
+setup_table_storage.sh
