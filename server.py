@@ -177,7 +177,7 @@ def get_sample():
 
 def data_loader_process():
 
-    f = open("data/small_fns.txt","r")
+    f = open("data/fns.txt", "r")
     naip_fns = []
     lc_fns = []
     lines = f.read().strip().split("\n")
