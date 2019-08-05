@@ -32,7 +32,7 @@ REPEAT_QUEUE = Queue()
 OUTPUT_QUEUE = Queue()
 
 global MAX_QUEUE_SIZE, SAMPLE_SIZE
-MAX_QUEUE_SIZE = 128
+MAX_QUEUE_SIZE = 256
 SAMPLE_SIZE = 240
 
 global TABLE_SERVICE, OUTPUT_PATH
@@ -101,7 +101,7 @@ def record_sample():
         data["labels"]
     ]
 
-    if num_times_labeled < 5:
+    if num_times_labeled < 4:
         REPEAT_QUEUE.put((data["fn"], data["x"], data["y"], num_times_labeled+1))
 
     OUTPUT_QUEUE.put(log_row)
@@ -177,7 +177,7 @@ def get_sample():
 
 def data_loader_process():
 
-    f = open("data/fns.txt", "r")
+    f = open("data/pa_fns.csv", "r")
     naip_fns = []
     lc_fns = []
     lines = f.read().strip().split("\n")
@@ -192,12 +192,12 @@ def data_loader_process():
     for i in range(len(naip_fns)):
         print("Loading %d/%d" % (i+1, len(naip_fns)))
 
-        f = rasterio.open(os.path.join("data", naip_fns[i]), "r")
+        f = rasterio.open(naip_fns[i], "r")
         naip_data = f.read()
         naip_data = np.rollaxis(naip_data, 0, 3)
         f.close()
 
-        f = rasterio.open(os.path.join("data", lc_fns[i]), "r")
+        f = rasterio.open(lc_fns[i], "r")
         lc_data = f.read()
         lc_data = lc_data.squeeze()
         lc_data[lc_data == 5] = 4
@@ -217,10 +217,10 @@ def data_loader_process():
 
             print("[%s]\tSAMPLE_QUEUE: %d\tREPEAT_QUEUE: %d\tOUTPUT_QUEUE: %d" % (time.ctime(), SAMPLE_QUEUE.qsize(), REPEAT_QUEUE.qsize(), OUTPUT_QUEUE.qsize()))
 
-            if not REPEAT_QUEUE.empty() and np.random.rand()<0.7:
+            if not REPEAT_QUEUE.empty():
                 fn, x, y, num_times_labeled = REPEAT_QUEUE.get()
                 idx = naip_fns.index(fn)
-
+                
                 naip_data = naip_tiles[idx]
                 lc_data = lc_tiles[idx]
             else:
@@ -304,6 +304,8 @@ def main():
     group.add_argument('--azure_table', action="store_true", dest="azure_table")
     group.add_argument("--output_path", action="store", dest="output_path", type=str, help="Path to directory where output will be stored")
 
+    parser.add_argument("--seed_data_fn", action="store", dest="seed_data_fn", type=str, help="Filename of seed data to put in the queue", default=None)
+
     args = parser.parse_args(sys.argv[1:])
 
     if args.azure_table:
@@ -319,7 +321,21 @@ def main():
         print("Setting up OUTPUT_PATH")
         OUTPUT_PATH = args.output_path
 
+    
+    if args.seed_data_fn is not None:
 
+        f = open(args.seed_data_fn, "r")
+        lines = f.read().strip().split("\n")
+        f.close()
+        
+        num_added = 0
+        for line in lines:
+            fn, x, y, num_times_labeled = line.split(",")
+            x, y, num_times_labeled = int(x), int(y), int(num_times_labeled)
+            REPEAT_QUEUE.put((fn, x, y, num_times_labeled))
+            num_added += 1
+        print("Pre-seeded the work queue with %d items" % (num_added))
+    
     p1 = Process(target=data_loader_process)
     p1.start()
 
