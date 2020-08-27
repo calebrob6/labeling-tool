@@ -2,7 +2,5 @@ data/
 output/
 __pycache__/
 .ipynb_checkpoints/
+.vscode/
 *.pyc
-
-setup_table_storage.sh
-
