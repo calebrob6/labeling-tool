@@ -4,38 +4,40 @@
 # pylint: disable=E1137,E1136,E0110
 import sys
 import os
+os.environ["CURL_CA_BUNDLE"] = "/etc/ssl/certs/ca-certificates.crt"
 import time
-
-import bottle
+import copy
 import argparse
 import base64
 import json
-
-import numpy as np
-import cv2
-
-import rasterio
-
 import uuid
-
 import logging
 
-from multiprocessing import Queue, Process
+from multiprocessing import Queue, Process, Manager
 from queue import Empty
 
-global SAMPLE_QUEUE, REPEAT_QUEUE, OUTPUT_QUEUE
+import numpy as np
+import pandas as pd
+
+import rasterio
+import rasterio.mask
+import rasterio.features
+import fiona
+import fiona.transform
+import shapely
+import shapely.geometry
+
+import cv2
+import bottle
+
+import utils
+
+global SAMPLE_QUEUE, OUTPUT_QUEUE, PENDING_LABELS, TIMEOUT_THRESHOLD
 SAMPLE_QUEUE = Queue()
-REPEAT_QUEUE = Queue()
 OUTPUT_QUEUE = Queue()
-
-global MAX_QUEUE_SIZE, SAMPLE_SIZE
-MAX_QUEUE_SIZE = 256
-SAMPLE_SIZE = 240
-
-global TABLE_SERVICE, INPUT_FN, OUTPUT_FN
-TABLE_SERVICE = None
-INPUT_FN = None
-OUTPUT_FN = None
+manager = Manager()
+PENDING_LABELS = manager.dict()
+TIMEOUT_THRESHOLD = 5 # in seconds
 
 #---------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------
@@ -58,6 +60,63 @@ def do_options():
 #---------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------
 
+def reverse_coordinates_geom(geom):
+    new_coords = []
+    for x,y in geom["coordinates"][0]:
+        new_coords.append((y,x))
+    geom["coordinates"] = [new_coords]
+    return geom
+
+def filter_fns(fns):
+    for fn in fns:    
+        if "/ny/" in fn and "/2017/" in fn:
+            return fn
+        elif "/pa/" in fn and "/2017/" in fn:
+            return fn
+        elif "/de/" in fn and "/2018/" in fn:
+            return fn
+        elif "/md/" in fn and "/2018/" in fn:
+            return fn
+        elif "/va/" in fn and "/2018/" in fn:
+            return fn
+        elif "/wv/" in fn and "/2018/" in fn:
+            return fn
+    raise ValueError("No valid fn found: " + str(fns))
+
+def get_imagery_from_geom(geom, src_crs):
+    fns = utils.NAIPTileIndex.lookup_naip_tile_by_geom(geom)
+    fn = filter_fns(fns)
+
+    out_image_pairs = []
+
+    with rasterio.open(utils.NAIP_BLOB_ROOT + "/" + fn) as f:
+        dst_crs = f.crs.to_string()
+        
+        geom = reverse_coordinates_geom(copy.deepcopy(geom))
+        geom_transformed = fiona.transform.transform_geom(src_crs, dst_crs, geom)
+        
+        shape_transformed = shapely.geometry.shape(geom_transformed)
+        
+        for buffer_amount in [50,100,200]:
+        
+            shape_transformed_buffered = shape_transformed.buffer(buffer_amount)
+            geom_transformed_buffered = shapely.geometry.mapping(shape_transformed_buffered.envelope)
+
+            out_image, out_transform = rasterio.mask.mask(f, [geom_transformed_buffered], crop=True, all_touched=True, filled=True)
+            out_image = np.rollaxis(out_image, 0, 3)
+            out_image = out_image[:,:,:3]
+
+            out_mask = rasterio.features.geometry_mask([geom_transformed], (out_image.shape[0], out_image.shape[1]), out_transform)
+
+            out_image_masked = out_image.copy()
+            out_image_masked[~out_mask] = [255,0,0]
+
+            out_image_pairs.append((out_image, out_image_masked))
+
+    return out_image_pairs
+
+
+
 def record_sample():
     bottle.response.content_type = 'application/json'
     data = bottle.request.json
@@ -65,83 +124,55 @@ def record_sample():
     # From https://stackoverflow.com/questions/31405812/how-to-get-client-ip-address-using-python-bottle-framework
     client_ip = bottle.request.environ.get('HTTP_X_FORWARDED_FOR') or bottle.request.environ.get('REMOTE_ADDR')
 
-    num_times_labeled = data["num_times_labeled"]
+    sample_idx = data["sample_idx"]
 
-    log_row = {
-        "client_ip": client_ip,
-        "out_time": str(data["time"]),
-        "in_time": time.ctime(),
-        "x": data["x"],
-        "y": data["y"],
-        "size": data["sample_size"],
-        "user_label": data["label"],
-        "number_of_times_labeled": num_times_labeled,
-    }
-    
-    if num_times_labeled < 4:
-        REPEAT_QUEUE.put((data["x"], data["y"], num_times_labeled+1))
+    if sample_idx in PENDING_LABELS:
 
-    OUTPUT_QUEUE.put(log_row)
+        log_row = {
+            "client_ip": client_ip,
+            "client_idx": data["client_idx"],
+            "out_time": str(data["time"]),
+            "in_time": time.ctime(),
+            "sample_idx": data["sample_idx"],
+            "user_label": data["user_label"]
+        }
+        
+        OUTPUT_QUEUE.put(log_row)
+        del PENDING_LABELS[sample_idx]
 
-    bottle.response.status = 200
-    return json.dumps(data)
+        bottle.response.status = 200
+        return json.dumps(data)
+    else:
+        print("Received a label that we didn't actually ask for... ignoring")
+        bottle.response.status = 200
+        return json.dumps(data)
 
 def get_sample():
     bottle.response.content_type = 'application/json'
     data = bottle.request.json
     
-    (x, y, imagery, img_patch, num_times_labeled) = SAMPLE_QUEUE.get()
+    inputs = SAMPLE_QUEUE.get()
+    geom = inputs["geom"]
+    sample_idx = inputs["sample_idx"]
+    src_crs = inputs["src_crs"]
 
-    r = 9
-    midpoint = SAMPLE_SIZE // 2
-    start_idx = midpoint-r-1
-    size = r*2 + 2
-    for i in range(start_idx, start_idx+size+1):
-        rem = (i//3)%3
-        color = [ 0 if rem==2 else 255, 255 if rem==0 else 0, 255 if rem==0 else 0 ]
-        img_patch[start_idx,i] = color
-        img_patch[i,start_idx] = color
-        img_patch[start_idx+size,i] = color
-        img_patch[i,start_idx+size] = color
-
-    img1 = img_patch.copy()
-    img2 = img_patch[60:-60,60:-60].copy()
-    img3 = img_patch[start_idx+1:start_idx+size,start_idx+1:start_idx+size].copy()
-
-    img1 = cv2.imencode(".jpg", cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))[1].tostring()
-    img1 = base64.b64encode(img1).decode("utf-8")
-    data["imgLarge"] = img1
-
-    #print("Image 1 size: %d" % (len(img1)))
-
-    img2 = cv2.imencode(".jpg", cv2.cvtColor(img2, cv2.COLOR_RGB2BGR))[1].tostring()
-    img2 = base64.b64encode(img2).decode("utf-8")
-    data["imgMedium"] = img2
-
-    #print("Image 2 size: %d" % (len(img2)))
-
-    t_h, t_w, t_c = img3.shape
+    in_image_pairs = get_imagery_from_geom(geom, src_crs)
     
-    img3 = cv2.imencode(".png", cv2.cvtColor(img3, cv2.COLOR_RGB2BGR))[1].tostring()
-    img3 = base64.b64encode(img3).decode("utf-8")
-    data["imgSmall"] = img3
+    out_image_pairs = []
+    for img1, img2 in in_image_pairs:
+        img1_str = cv2.imencode(".jpg", cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))[1].tobytes()
+        img2_str = cv2.imencode(".jpg", cv2.cvtColor(img2, cv2.COLOR_RGB2BGR))[1].tobytes()
 
-    #print("Image 3 size: %d" % (len(img3)))
+        img1_str = base64.b64encode(img1_str).decode("utf-8")
+        img2_str = base64.b64encode(img2_str).decode("utf-8")
 
-    img4 = imagery.copy()
-    cv2.circle(img4, (x, y), 100, (255,0,0), thickness=-1)
-    img4 = cv2.resize(img4, (0,0), fx=0.1, fy=0.1, interpolation=cv2.INTER_AREA) 
-    img4 = cv2.imencode(".jpg", cv2.cvtColor(img4, cv2.COLOR_RGB2BGR))[1].tostring()
-    img4 = base64.b64encode(img4).decode("utf-8")
-    data["imgHuge"] = img4
-
-    #print("Image 4 size: %d" % (len(img4)))
+        out_image_pairs.append((img1_str, img2_str))
 
     data["time"] = time.ctime()
-    data["x"] = x
-    data["y"] = y
-    data["sample_size"] = SAMPLE_SIZE
-    data["num_times_labeled"] = num_times_labeled
+    data["sample_idx"] = sample_idx
+    data["img_pairs"] = out_image_pairs
+
+    PENDING_LABELS[sample_idx] = (time.time(), inputs)
 
     bottle.response.status = 200
     return json.dumps(data)
@@ -150,57 +181,67 @@ def get_sample():
 #---------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------
 
-def data_loader_process():
+def data_loader_process(input_fn, existing_sample_idxs):
+    existing_sample_idxs = set(existing_sample_idxs)
 
-    nodata_val = 0.0
-    with rasterio.open(INPUT_FN, "r") as f:
-        imagery = np.rollaxis(f.read(), 0, 3)
-        nodata_val = f.nodata
-        assert imagery.shape[2] == 3, "3-band RGB imagery required"
-    print("Finished pre-loading data")
-
-    i = 0
-    while True:
-        if SAMPLE_QUEUE.qsize() < MAX_QUEUE_SIZE:
-            print("[%s]\tSAMPLE_QUEUE: %d\tREPEAT_QUEUE: %d\tOUTPUT_QUEUE: %d" % (time.ctime(), SAMPLE_QUEUE.qsize(), REPEAT_QUEUE.qsize(), OUTPUT_QUEUE.qsize()))
-            
-            if not REPEAT_QUEUE.empty():
-                x, y, num_times_labeled = REPEAT_QUEUE.get()
-                img_patch = imagery[y:y+SAMPLE_SIZE, x:x+SAMPLE_SIZE]
+    geoms = []
+    sample_idxs = []
+    skipped_idxs = 0
+    with fiona.open(input_fn) as f:
+        src_crs = f.crs["init"]
+        for row in f:
+            sample_idx = row["properties"]["idx"]
+            if row["properties"]["idx"] in existing_sample_idxs:
+                skipped_idxs += 1
             else:
-                num_times_labeled = 0
-                
-                any_nodata = True
-                while any_nodata:
-                    x = np.random.randint(0, imagery.shape[1]-SAMPLE_SIZE)
-                    y = np.random.randint(0, imagery.shape[0]-SAMPLE_SIZE)
-                    img_patch = imagery[y:y+SAMPLE_SIZE, x:x+SAMPLE_SIZE]
-                    any_nodata = np.any(np.sum(img_patch == nodata_val, axis=2) == 3)
+                geoms.append(row["geometry"])
+                sample_idxs.append(sample_idx)
 
-            SAMPLE_QUEUE.put((x, y, imagery, img_patch, num_times_labeled))
-            
-            i += 1
-        else:
-            # sleep a bit, then check to see if the queue is full
-            time.sleep(0.5)
+    print(f"Skipped {skipped_idxs} samples that have already been labeled")
+
+    for i in range(len(geoms)):
+        SAMPLE_QUEUE.put({
+            "geom": geoms[i],
+            "sample_idx": sample_idxs[i],
+            "src_crs": src_crs
+        })
+
+    # Constantly monitor the PENDING_LABELS dictionary for items that have been sent out for labeling, but we haven't gotten an answer for in more than TIMEOUT_THRESHOLD seconds. If this happens, requeue that item.
+    while True:
+        try:
+            del_list = []
+            for sample_idx, (out_time, inputs) in PENDING_LABELS.items():
+                if time.time() - out_time > TIMEOUT_THRESHOLD:
+                    print("Time out for sample %d" % (sample_idx))
+                    SAMPLE_QUEUE.put(inputs)
+                    del_list.append(sample_idx)
+            for sample_idx in del_list:
+                del PENDING_LABELS[sample_idx]
+
+        except Exception as e:
+            print(e)
+        time.sleep(2)
 
 #---------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------
 
-def print_process():
+def results_process(output_fn):
+    print(f"Saving results to {output_fn}")
+    
     while True:
         if not OUTPUT_QUEUE.empty():
             row = OUTPUT_QUEUE.get()
 
+            print(row)
+            
             keys = sorted(row.keys())
-
-            if not os.path.exists(OUTPUT_FN):
-                with open(OUTPUT_FN, "w") as f:
+            if not os.path.exists(output_fn):
+                with open(output_fn, "w") as f:
                     f.write("%s\n" % (
                         ",".join(keys)
                     ))
                    
-            with open(OUTPUT_FN, "a") as f:
+            with open(output_fn, "a") as f:
                 for i, key in enumerate(keys):
                     f.write(str(row[key]))
                     if i < len(keys)-1:
@@ -224,44 +265,39 @@ def everything_else(filepath):
 #---------------------------------------------------------------------------------------
 
 def main():
-    global TABLE_SERVICE, INPUT_FN, OUTPUT_FN
     parser = argparse.ArgumentParser(description="Server")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debugging", default=False)
     parser.add_argument("--host", action="store", dest="host", type=str, help="Host to bind to", default="0.0.0.0")
     parser.add_argument("--port", action="store", dest="port", type=int, help="Port to listen on", default=4042)
     
-    parser.add_argument("--input_fn", action="store", dest="input_fn", type=str, help="Path to filename to crop samples from")
-    parser.add_argument("--output_fn", action="store", dest="output_fn", type=str, help="Path to directory where output will be stored")
-    parser.add_argument("--seed_data_fn", action="store", dest="seed_data_fn", type=str, help="Filename of seed data to put in the queue", default=None)
+    parser.add_argument("--input_fn", action="store", dest="input_fn", type=str, help="Path to geojson of input polygons")
+    parser.add_argument("--output_fn", action="store", dest="output_fn", type=str, help="Path to filename where output will be stored")
 
     args = parser.parse_args(sys.argv[1:])
 
-
-    assert not os.path.exists(args.output_fn), "The output file already exists, data would be overwritten, exiting..."
-    OUTPUT_FN = args.output_fn
     assert os.path.exists(args.input_fn), "The input file does not exist, exiting..."
-    INPUT_FN = args.input_fn
     
-    if args.seed_data_fn is not None:
 
-        f = open(args.seed_data_fn, "r")
-        lines = f.read().strip().split("\n")
-        f.close()
-        
-        num_added = 0
-        for line in lines:
-            fn, x, y, num_times_labeled = line.split(",")
-            x, y, num_times_labeled = int(x), int(y), int(num_times_labeled)
-            REPEAT_QUEUE.put((fn, x, y, num_times_labeled))
-            num_added += 1
-        print("Pre-seeded the work queue with %d items" % (num_added))
-    
-    p1 = Process(target=data_loader_process)
+    print("Loading NAIP index")
+    try:
+        utils.NAIPTileIndex.lookup({})
+    except:
+        pass
+    print("Finishing loading NAIP index")
+
+
+    existing_sample_idxs = []
+    if os.path.exists(args.output_fn):
+        df = pd.read_csv(args.output_fn)
+        for sample_idx in df["sample_idx"].values:
+            existing_sample_idxs.append(sample_idx)
+
+    p1 = Process(target=data_loader_process, args=(args.input_fn, existing_sample_idxs,))
     p1.start()
 
-    p2 = Process(target=print_process)
-    p2.start() 
+    p2 = Process(target=results_process, args=(args.output_fn,))
+    p2.start()
 
     # Setup the bottle server 
     app = bottle.Bottle()
